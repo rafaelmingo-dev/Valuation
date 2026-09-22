@@ -4262,6 +4262,33 @@ def forward_multiple_targets(symbol, hist_mkt, assump, start_revenue):
     net_income1 = rev1 * assump["net_margin"]
     eps1 = net_income1 / assump["shares"]
 
+    # Ano 2 usa a MESMA projeção-base já produzida pelo DCF.
+    # Nenhuma nova premissa de crescimento é introduzida.
+    if len(base_proj) < 2:
+        raise ValueError(
+            "Projeção base possui menos de 2 anos; alvo de 24 meses indisponível."
+        )
+    rev2 = float(base_proj["revenue"].iloc[1])
+    ebit2 = float(base_proj["ebit"].iloc[1])
+    da2 = float(base_proj["da"].iloc[1])
+    capex2 = float(base_proj["capex"].iloc[1])
+    sustaining_capex2 = (
+        float(base_proj["sustaining_capex"].iloc[1])
+        if "sustaining_capex" in base_proj.columns
+        and pd.notna(base_proj["sustaining_capex"].iloc[1])
+        else np.nan
+    )
+    growth_capex2 = (
+        float(base_proj["growth_capex"].iloc[1])
+        if "growth_capex" in base_proj.columns
+        and pd.notna(base_proj["growth_capex"].iloc[1])
+        else np.nan
+    )
+    fcff2 = float(base_proj["fcff"].iloc[1])
+    ebitda2 = ebit2 + da2
+    net_income2 = rev2 * assump["net_margin"]
+    eps2 = net_income2 / assump["shares"]
+
     # Política de remuneração discutida para cada companhia.
     # Petrobras: 45% do FCL. Neste modelo, FCFF é mantido como proxy explícita
     # (não é afirmado como reprodução exata do FCL societário da política).
@@ -4319,6 +4346,38 @@ def forward_multiple_targets(symbol, hist_mkt, assump, start_revenue):
             "usado apenas porque o payout normalizado ficou indisponível"
         )
 
+    # Dividendo do ano 2: aplica exatamente a mesma política já usada no ano 1,
+    # porém sobre os números do segundo ano da projeção-base.
+    if symbol == "PETR4":
+        dividend_policy_value_2 = 0.45 * max(fcff2, 0.0)
+    elif symbol == "VALE3":
+        if pd.notna(sustaining_capex2) and np.isfinite(sustaining_capex2):
+            dividend_policy_value_2 = 0.30 * max(ebitda2 - sustaining_capex2, 0.0)
+        else:
+            dividend_policy_value_2 = 0.30 * max(ebitda2 - capex2, 0.0)
+    else:
+        dividend_policy_value_2 = (
+            max(net_income2, 0.0) * payout_norm
+            if pd.notna(payout_norm) and np.isfinite(payout_norm)
+            else np.nan
+        )
+
+    expected_dividend_24m = (
+        dividend_policy_value_2 / assump["shares"]
+        if pd.notna(dividend_policy_value_2)
+        and np.isfinite(dividend_policy_value_2)
+        and assump["shares"] > 0
+        else np.nan
+    )
+
+    if pd.isna(expected_dividend_24m) or not np.isfinite(expected_dividend_24m):
+        div_hist = pd.to_numeric(
+            h.get("dividend_ps", pd.Series(dtype=float)),
+            errors="coerce",
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        div_hist = div_hist[div_hist >= 0]
+        expected_dividend_24m = safe_median(div_hist.tail(4), 0.0)
+
     pe_target = eps1 * pe_norm if pd.notna(pe_norm) and np.isfinite(pe_norm) and eps1 > 0 else np.nan
     if pd.notna(ev_ebitda_norm):
         target_ev = ebitda1 * ev_ebitda_norm
@@ -4331,6 +4390,35 @@ def forward_multiple_targets(symbol, hist_mkt, assump, start_revenue):
     # quando o DY histórico normalizado estiver muito elevado, o programa apenas
     # sinaliza o risco de o histórico conter distribuições extraordinárias.
     dy_target = expected_dividend / dy_norm if pd.notna(expected_dividend) and np.isfinite(expected_dividend) and expected_dividend > 0 and pd.notna(dy_norm) and np.isfinite(dy_norm) and dy_norm > 0 else np.nan
+
+    # Métodos de 24 meses usam o segundo ano da MESMA projeção e os MESMOS
+    # múltiplos normalizados. Não há nova curva de crescimento nem novo múltiplo.
+    pe_target_24m = (
+        eps2 * pe_norm
+        if pd.notna(pe_norm) and np.isfinite(pe_norm) and eps2 > 0
+        else np.nan
+    )
+    if pd.notna(ev_ebitda_norm):
+        target_ev_24m = ebitda2 * ev_ebitda_norm
+        # O motor não projeta uma trajetória explícita de dívida líquida.
+        # Portanto, preserva-se a mesma convenção do método de 12 meses:
+        # dívida líquida atual, sem inventar desalavancagem futura.
+        target_equity_24m = target_ev_24m - assump["net_debt"]
+        ev_ebitda_target_24m = target_equity_24m / assump["shares"]
+    else:
+        ev_ebitda_target_24m = np.nan
+
+    dy_target_24m = (
+        expected_dividend_24m / dy_norm
+        if pd.notna(expected_dividend_24m)
+        and np.isfinite(expected_dividend_24m)
+        and expected_dividend_24m > 0
+        and pd.notna(dy_norm)
+        and np.isfinite(dy_norm)
+        and dy_norm > 0
+        else np.nan
+    )
+
     dy_warning = None
     if pd.notna(dy_norm) and pd.notna(assump.get("cost_equity", np.nan)) and dy_norm > assump["cost_equity"]:
         dy_warning = (
@@ -4352,11 +4440,23 @@ def forward_multiple_targets(symbol, hist_mkt, assump, start_revenue):
         "fcff1": fcff1,
         "net_income1": net_income1,
         "eps1": eps1,
+        "rev2": rev2,
+        "ebitda2": ebitda2,
+        "capex2": capex2,
+        "sustaining_capex2": sustaining_capex2,
+        "growth_capex2": growth_capex2,
+        "fcff2": fcff2,
+        "net_income2": net_income2,
+        "eps2": eps2,
         "expected_dividend": expected_dividend,
+        "expected_dividend_24m": expected_dividend_24m,
         "dividend_method": dividend_method,
         "pe_target": pe_target,
         "ev_ebitda_target": ev_ebitda_target,
         "dy_target": dy_target,
+        "pe_target_24m": pe_target_24m,
+        "ev_ebitda_target_24m": ev_ebitda_target_24m,
+        "dy_target_24m": dy_target_24m,
         "dy_warning": dy_warning,
     }
 
@@ -5156,8 +5256,49 @@ def forward_equity_targets(symbol, asset, hist_mkt, ttm, assump):
     )
 
     first = ri_legacy["projection"].iloc[0]
+    if len(ri_legacy["projection"]) < 2 or len(ri["projection"]) < 2:
+        raise ValueError(
+            "Projeção patrimonial possui menos de 2 anos; alvo de 24 meses indisponível."
+        )
+    second = ri_legacy["projection"].iloc[1]
+    coherent_first = ri["projection"].iloc[0]
+    coherent_second = ri["projection"].iloc[1]
+
     eps1 = float(first["net_income"]) / security_count
     bvps1 = float(first["book_end"]) / security_count
+    eps2 = float(second["net_income"]) / security_count
+    bvps2 = float(second["book_end"]) / security_count
+
+    expected_dividend_24m = (
+        float(second["dividends"]) / security_count
+        if pd.notna(second["dividends"])
+        and np.isfinite(second["dividends"])
+        and security_count > 0
+        else np.nan
+    )
+
+    coherent_dividend_1 = (
+        float(coherent_first["dividends"]) / security_count
+        if pd.notna(coherent_first["dividends"])
+        and np.isfinite(coherent_first["dividends"])
+        and security_count > 0
+        else np.nan
+    )
+    coherent_dividend_2 = (
+        float(coherent_second["dividends"]) / security_count
+        if pd.notna(coherent_second["dividends"])
+        and np.isfinite(coherent_second["dividends"])
+        and security_count > 0
+        else np.nan
+    )
+    ri_target_24m = (
+        float(ri["fair_price_today"]) * ((1.0 + float(assump["cost_equity"])) ** 2)
+        - coherent_dividend_1 * (1.0 + float(assump["cost_equity"]))
+        - coherent_dividend_2
+        if np.isfinite(coherent_dividend_1)
+        and np.isfinite(coherent_dividend_2)
+        else np.nan
+    )
 
     pe_target = (
         eps1 * pe_norm
@@ -5174,6 +5315,26 @@ def forward_equity_targets(symbol, asset, hist_mkt, ttm, assump):
         if pd.notna(expected_dividend)
         and np.isfinite(expected_dividend)
         and expected_dividend >= 0
+        and np.isfinite(dy_norm)
+        and dy_norm > 0
+        else np.nan
+    )
+
+    pe_target_24m = (
+        eps2 * pe_norm
+        if eps2 > 0 and np.isfinite(pe_norm)
+        else np.nan
+    )
+    pb_target_24m = (
+        bvps2 * pb_norm
+        if bvps2 > 0 and np.isfinite(pb_norm)
+        else np.nan
+    )
+    dy_target_24m = (
+        expected_dividend_24m / dy_norm
+        if pd.notna(expected_dividend_24m)
+        and np.isfinite(expected_dividend_24m)
+        and expected_dividend_24m >= 0
         and np.isfinite(dy_norm)
         and dy_norm > 0
         else np.nan
@@ -5197,6 +5358,25 @@ def forward_equity_targets(symbol, asset, hist_mkt, ttm, assump):
         or not np.isfinite(methods.get(name, np.nan))
     ]
 
+    methods_24m = {
+        "Residual Income 12m": ri_target_24m,
+        "P/L 12m": pe_target_24m,
+        "P/VP 12m": pb_target_24m,
+        "Dividend Yield 12m": dy_target_24m,
+    }
+    missing_24m = [
+        name for name in EQUITY_METHOD_WEIGHTS
+        if pd.isna(methods_24m.get(name, np.nan))
+        or not np.isfinite(methods_24m.get(name, np.nan))
+    ]
+    final_target_24m = (
+        float(sum(
+            max(float(methods_24m[name]), 0.0) * weight
+            for name, weight in EQUITY_METHOD_WEIGHTS.items()
+        ))
+        if not missing_24m else np.nan
+    )
+
     method_rows = []
     floored = []
     for name, weight in EQUITY_METHOD_WEIGHTS.items():
@@ -5212,6 +5392,7 @@ def forward_equity_targets(symbol, asset, hist_mkt, ttm, assump):
         method_rows.append({
             "Método": name,
             "Preço-alvo bruto 12m": raw,
+            "Preço-alvo bruto 24m": methods_24m.get(name, np.nan),
             "Peso original": weight,
             "Valor usado no composto": used,
             "Peso usado": used_weight,
@@ -5251,16 +5432,25 @@ def forward_equity_targets(symbol, asset, hist_mkt, ttm, assump):
         "dy_norm": dy_norm,
         "payout_norm": payout_norm,
         "expected_dividend": expected_dividend,
+        "expected_dividend_24m": expected_dividend_24m,
         "dividend_method": dividend_method,
         "eps1": eps1,
         "bvps1": bvps1,
+        "eps2": eps2,
+        "bvps2": bvps2,
+        "ri_target_24m": ri_target_24m,
         "pe_target": pe_target,
         "pb_target": pb_target,
         "dy_target": dy_target,
+        "pe_target_24m": pe_target_24m,
+        "pb_target_24m": pb_target_24m,
+        "dy_target_24m": dy_target_24m,
         "method_table": method_df,
         "missing_methods": missing,
+        "missing_methods_24m": missing_24m,
         "floored_methods": floored,
         "target_12m": final_target,
+        "target_24m": final_target_24m,
         "upside": upside,
         "legacy_target_12m": legacy_final_target,
         "legacy_missing_methods": legacy_missing,
@@ -5345,6 +5535,15 @@ def run_equity_asset(symbol, asset, rate_context):
         validated_target_12m / price - 1.0
         if pd.notna(validated_target_12m)
         and np.isfinite(validated_target_12m)
+        and price > 0
+        else np.nan
+    )
+
+    validated_target_24m = np.nan if profile == "holding" else targets["target_24m"]
+    validated_upside_24m = (
+        validated_target_24m / price - 1.0
+        if pd.notna(validated_target_24m)
+        and np.isfinite(validated_target_24m)
         and price > 0
         else np.nan
     )
@@ -5488,6 +5687,7 @@ def run_equity_asset(symbol, asset, rate_context):
     )
     if profile == "holding":
         print("ALVO FINAL VALIDADO 12M      : n/d — holding exige NAV/SOTP")
+        print("ALVO FINAL VALIDADO 24M      : n/d — holding exige NAV/SOTP")
         print("UPSIDE/DOWNSIDE VALIDADO     : n/d")
     else:
         print(
@@ -5495,8 +5695,16 @@ def run_equity_asset(symbol, asset, rate_context):
             + (f"R$ {validated_target_12m:,.2f}" if pd.notna(validated_target_12m) else "n/d")
         )
         print(
-            "UPSIDE/DOWNSIDE VALIDADO     : "
+            "ALVO FINAL VALIDADO 24M      : "
+            + (f"R$ {validated_target_24m:,.2f}" if pd.notna(validated_target_24m) else "n/d")
+        )
+        print(
+            "UPSIDE/DOWNSIDE VALIDADO 12M : "
             + (f"{validated_upside:.1%}" if pd.notna(validated_upside) else "n/d")
+        )
+        print(
+            "POTENCIAL PREÇO 24M          : "
+            + (f"{validated_upside_24m:.1%}" if pd.notna(validated_upside_24m) else "n/d")
         )
     print("-" * 90)
 
@@ -5564,10 +5772,17 @@ def run_equity_asset(symbol, asset, rate_context):
         "legacy_target_12m": targets.get("legacy_target_12m", np.nan),
         "validated_target_12m": validated_target_12m,
         "validated_upside": validated_upside,
+        "target_24m": targets["target_24m"],
+        "validated_target_24m": validated_target_24m,
+        "validated_upside_24m": validated_upside_24m,
         "expected_dividend": targets["expected_dividend"],
+        "expected_dividend_24m": targets["expected_dividend_24m"],
         "pe_target": targets["pe_target"],
         "pb_target": targets["pb_target"],
         "dy_target": targets["dy_target"],
+        "pe_target_24m": targets["pe_target_24m"],
+        "pb_target_24m": targets["pb_target_24m"],
+        "dy_target_24m": targets["dy_target_24m"],
         "missing_methods": targets["missing_methods"],
         "floored_methods": targets["floored_methods"],
         "model_profile": profile,
@@ -5684,17 +5899,29 @@ def run_asset(symbol, asset, rate_context):
 
     mult = forward_multiple_targets(symbol, hist_mkt, assump, start_revenue)
     expected_dividend = mult["expected_dividend"]
+    expected_dividend_24m = mult["expected_dividend_24m"]
 
-    # Converte DCF de hoje para um alvo ex-dividendo em 12 meses.
-    # Mantém a convenção já adotada no modelo: valor do equity cresce por Ke e
-    # o provento esperado é retirado do preço ex-dividendo.
+    # Converte DCF de hoje para alvos ex-dividendo em 12 e 24 meses.
+    # A regra de 24m é a extensão temporal exata da convenção já usada em 12m:
+    # capitaliza o valor justo a Ke e retira os dividendos esperados nos dois anos.
     dcf_12m = weighted_dcf_today * (1 + assump["cost_equity"]) - expected_dividend
+    dcf_24m = (
+        weighted_dcf_today * ((1 + assump["cost_equity"]) ** 2)
+        - expected_dividend * (1 + assump["cost_equity"])
+        - expected_dividend_24m
+    )
 
     method_values = {
         "DCF 12m": dcf_12m,
         "P/L 12m": mult["pe_target"],
         "EV/EBITDA 12m": mult["ev_ebitda_target"],
         "Dividend Yield 12m": mult["dy_target"],
+    }
+    method_values_24m = {
+        "DCF 12m": dcf_24m,
+        "P/L 12m": mult["pe_target_24m"],
+        "EV/EBITDA 12m": mult["ev_ebitda_target_24m"],
+        "Dividend Yield 12m": mult["dy_target_24m"],
     }
 
     # Composto FCFF genérico — preservado integralmente para comparação/auditoria.
@@ -5718,6 +5945,28 @@ def run_asset(symbol, asset, rate_context):
         else np.nan
     )
 
+    available_24m = {
+        k: float(v)
+        for k, v in method_values_24m.items()
+        if pd.notna(v) and np.isfinite(v)
+    }
+    missing_methods_24m = [k for k in METHOD_WEIGHTS if k not in available_24m]
+    composite_values_24m = {k: max(v, 0.0) for k, v in available_24m.items()}
+    all_methods_available_24m = len(missing_methods_24m) == 0
+    generic_final_target_24m = (
+        sum(
+            composite_values_24m[k] * METHOD_WEIGHTS[k]
+            for k in METHOD_WEIGHTS
+        )
+        if all_methods_available_24m else np.nan
+    )
+    generic_upside_24m = (
+        generic_final_target_24m / price - 1
+        if pd.notna(generic_final_target_24m)
+        and np.isfinite(generic_final_target_24m)
+        else np.nan
+    )
+
     # ----------------------------------------------------------------
     # Residual Income — legado preservado + RI coerente ativado.
     # regulated: RI coerente ocupa o slot principal de 50%.
@@ -5733,6 +5982,9 @@ def run_asset(symbol, asset, rate_context):
     ri_floored_methods = []
     ri_final_target = np.nan
     ri_upside = np.nan
+    ri_final_target_24m = np.nan
+    ri_upside_24m = np.nan
+    ri_missing_methods_24m = []
     ri_legacy_final_target = np.nan
 
     if profile in {"regulated", "high_roic_growth"}:
@@ -5754,11 +6006,35 @@ def run_asset(symbol, asset, rate_context):
                 payout_norm=mult["payout_norm"],
                 profile_label=profile,
             )
+            ri_projection = ri_result.get("projection", pd.DataFrame())
+            if len(ri_projection) < 2:
+                raise ValueError(
+                    "RI coerente possui menos de 2 anos; alvo de 24 meses indisponível."
+                )
+            ri_dividend_1 = (
+                float(ri_projection.iloc[0]["dividends"]) / assump["shares"]
+            )
+            ri_dividend_2 = (
+                float(ri_projection.iloc[1]["dividends"]) / assump["shares"]
+            )
+            ri_target_24m_primary = (
+                float(ri_result["fair_price_today"])
+                * ((1.0 + float(assump["cost_equity"])) ** 2)
+                - ri_dividend_1 * (1.0 + float(assump["cost_equity"]))
+                - ri_dividend_2
+            )
+
             ri_method_values = {
                 "DCF 12m": ri_result["target_12m"],
                 "P/L 12m": mult["pe_target"],
                 "EV/EBITDA 12m": mult["ev_ebitda_target"],
                 "Dividend Yield 12m": mult["dy_target"],
+            }
+            ri_method_values_24m = {
+                "DCF 12m": ri_target_24m_primary,
+                "P/L 12m": mult["pe_target_24m"],
+                "EV/EBITDA 12m": mult["ev_ebitda_target_24m"],
+                "Dividend Yield 12m": mult["dy_target_24m"],
             }
             ri_available = {
                 k: float(v) for k, v in ri_method_values.items()
@@ -5774,6 +6050,30 @@ def run_asset(symbol, asset, rate_context):
             ri_upside = (
                 ri_final_target / price - 1
                 if pd.notna(ri_final_target) and np.isfinite(ri_final_target) else np.nan
+            )
+
+            ri_available_24m = {
+                k: float(v) for k, v in ri_method_values_24m.items()
+                if pd.notna(v) and np.isfinite(v)
+            }
+            ri_missing_methods_24m = [
+                k for k in METHOD_WEIGHTS if k not in ri_available_24m
+            ]
+            ri_composite_values_24m = {
+                k: max(v, 0.0) for k, v in ri_available_24m.items()
+            }
+            ri_final_target_24m = (
+                sum(
+                    ri_composite_values_24m[k] * METHOD_WEIGHTS[k]
+                    for k in METHOD_WEIGHTS
+                )
+                if len(ri_missing_methods_24m) == 0 else np.nan
+            )
+            ri_upside_24m = (
+                ri_final_target_24m / price - 1
+                if pd.notna(ri_final_target_24m)
+                and np.isfinite(ri_final_target_24m)
+                else np.nan
             )
 
             legacy_values = {
@@ -5839,6 +6139,13 @@ def run_asset(symbol, asset, rate_context):
         validated_upside = (
             ri_upside if pd.notna(validated_final_target) and np.isfinite(validated_final_target) else np.nan
         )
+        validated_final_target_24m = (
+            ri_final_target_24m
+            if governance["validated_final_target"]
+            and ri_ready
+            and len(ri_missing_methods_24m) == 0
+            else np.nan
+        )
     else:
         validated_final_target = (
             generic_final_target
@@ -5850,6 +6157,19 @@ def run_asset(symbol, asset, rate_context):
             if pd.notna(validated_final_target) and np.isfinite(validated_final_target)
             else np.nan
         )
+        validated_final_target_24m = (
+            generic_final_target_24m
+            if governance["validated_final_target"] and all_methods_available_24m
+            else np.nan
+        )
+
+    validated_upside_24m = (
+        validated_final_target_24m / price - 1
+        if pd.notna(validated_final_target_24m)
+        and np.isfinite(validated_final_target_24m)
+        and price > 0
+        else np.nan
+    )
 
     # Compatibilidade: target_12m/upside continuam representando o composto genérico
     # calculado pelo motor. Os novos campos validated_* distinguem o que pode ser
@@ -5859,6 +6179,7 @@ def run_asset(symbol, asset, rate_context):
 
     method_df = pd.DataFrame({
         "Preço-alvo bruto 12m": pd.Series(method_values),
+        "Preço-alvo bruto 24m": pd.Series(method_values_24m),
         "Peso original": pd.Series(METHOD_WEIGHTS),
     })
     method_df["Valor usado no composto"] = [
@@ -6425,7 +6746,16 @@ def run_asset(symbol, asset, rate_context):
     else:
         print(f"ALVO FINAL VALIDADO 12M    : n/d — {governance['status']}")
         print("UPSIDE/DOWNSIDE VALIDADO   : n/d")
-    print(f"DIVIDENDO PROJ. 12M        : R$ {expected_dividend:,.2f}/ação")
+
+    if pd.notna(validated_final_target_24m):
+        print(f"ALVO FINAL VALIDADO 24M    : R$ {validated_final_target_24m:,.2f}")
+        print(f"POTENCIAL PREÇO 24M        : {validated_upside_24m:.1%}")
+    else:
+        print(f"ALVO FINAL VALIDADO 24M    : n/d — {governance['status']}")
+        print("POTENCIAL PREÇO 24M        : n/d")
+
+    print(f"DIVIDENDO PROJ. ANO 1      : R$ {expected_dividend:,.2f}/ação")
+    print(f"DIVIDENDO PROJ. ANO 2      : R$ {expected_dividend_24m:,.2f}/ação")
     print("-" * 90)
 
     print("\nSENSIBILIDADE DCF BASE — preço justo hoje | reinvestimento terminal coerente")
@@ -6621,21 +6951,32 @@ def run_asset(symbol, asset, rate_context):
         "residual_income_legacy": ri_legacy_result,
         "ri_error": ri_error,
         "ri_target_12m": ri_final_target,
+        "ri_target_24m": ri_final_target_24m,
         "ri_legacy_target_12m": ri_legacy_final_target,
         "ri_upside": ri_upside,
+        "ri_upside_24m": ri_upside_24m,
         "ri_missing_methods": ri_missing_methods,
+        "ri_missing_methods_24m": ri_missing_methods_24m,
         "ri_floored_methods": ri_floored_methods,
         "floored_methods": floored_methods,
         "missing_methods": missing_methods,
+        "missing_methods_24m": missing_methods_24m,
         "weighted_dcf_today": weighted_dcf_today,
         "target_12m": generic_final_target,
+        "target_24m": generic_final_target_24m,
         "upside": generic_upside,
+        "upside_24m": generic_upside_24m,
         "generic_target_12m": generic_final_target,
+        "generic_target_24m": generic_final_target_24m,
         "generic_upside": generic_upside,
+        "generic_upside_24m": generic_upside_24m,
         "validated_target_12m": validated_final_target,
+        "validated_target_24m": validated_final_target_24m,
         "validated_upside": validated_upside,
+        "validated_upside_24m": validated_upside_24m,
         "model_governance": governance,
         "expected_dividend": expected_dividend,
+        "expected_dividend_24m": expected_dividend_24m,
         "sensitivity": sens,
         "diagnostics": diagnostics,
         "market_cap_detail": market_cap_detail,
