@@ -591,8 +591,14 @@ def _row_border_for_attractive(row: pd.Series):
     Destaca visualmente, sem alterar nenhum dado, as linhas em que o preço atual
     está abaixo do alvo final validado de 12 meses.
 
-    A borda é apenas um sinal visual. O critério econômico continua sendo o mesmo
-    já usado pelo painel: alvo validado 12m > preço atual.
+    O grid nativo do Streamlit nem sempre preserva bordas CSS do Pandas Styler.
+    Por isso usamos três sinais redundantes e puramente visuais:
+    1) marcador "🟢" na primeira coluna;
+    2) fundo verde suave em toda a linha;
+    3) borda verde CSS quando o frontend a suporta.
+
+    O critério econômico continua exatamente o mesmo:
+    alvo validado 12m > preço atual.
     """
     price = _parse_number(row.get("Preço atual"))
     target = _parse_number(row.get("Alvo validado 12m"))
@@ -600,12 +606,17 @@ def _row_border_for_attractive(row: pd.Series):
     if price is None or target is None or not (target > price):
         return [""] * len(row)
 
-    base = "border-top: 2px solid #22c55e; border-bottom: 2px solid #22c55e;"
+    base = (
+        "background-color: rgba(34, 197, 94, 0.13); "
+        "font-weight: 600; "
+        "border-top: 2px solid #22c55e; "
+        "border-bottom: 2px solid #22c55e;"
+    )
     styles = [base] * len(row)
 
     if styles:
-        styles[0] += " border-left: 2px solid #22c55e;"
-        styles[-1] += " border-right: 2px solid #22c55e;"
+        styles[0] += " border-left: 3px solid #22c55e;"
+        styles[-1] += " border-right: 3px solid #22c55e;"
 
     return styles
 
@@ -628,6 +639,25 @@ def render_highlighted_selectable_table(
         return None
 
     display = df.copy().reset_index(drop=True)
+
+    # Marcador visual explícito. Não altera nenhum cálculo.
+    if "Sinal" not in display.columns:
+        signal_values = []
+        for _, row in display.iterrows():
+            price = _parse_number(row.get("Preço atual"))
+            target = _parse_number(row.get("Alvo validado 12m"))
+            signal_values.append(
+                "🟢" if (
+                    price is not None
+                    and target is not None
+                    and target > price
+                ) else ""
+            )
+        display.insert(
+            1 if "Ativo" in display.columns else 0,
+            "Sinal",
+            signal_values,
+        )
 
     styler = display.style.apply(_row_border_for_attractive, axis=1)
 
@@ -966,7 +996,10 @@ with tab_radar:
     )
 
     render_decision_legend()
-    st.caption("🟢 Borda verde = preço atual abaixo do alvo final validado de 12 meses.")
+    st.caption(
+        "🟢 Destaque verde = preço atual abaixo do alvo final validado de 12 meses. "
+        "O marcador verde é sempre exibido; fundo/borda verde são reforços visuais."
+    )
 
     selected = render_highlighted_selectable_table(clear_df, key="radar_main_clear")
     if selected:
@@ -990,18 +1023,26 @@ with tab_radar:
 with tab_candidates:
     st.subheader("⭐ Candidatos prioritários")
     st.caption(
-        "Ativos cuja combinação atual de qualidade, valuation e confiança já foi classificada "
-        "pelo próprio Radar como candidata prioritária."
+        "Mesma regra dos cartões superiores: qualidade aprovada (Forte/Excelente no grupo) "
+        "+ valuation final ATRATIVO pelo alvo validado de 12 meses. "
+        "A confiança/divergência dos métodos continua visível como auditoria."
     )
 
     if radar_df.empty:
         st.info("Sem dados.")
     else:
-        mask = radar_df["Status de Carteira"].astype(str).str.contains(
-            "CANDIDATO PRIORITÁRIO",
-            regex=False,
-        )
-        candidate_symbols = set(radar_df.loc[mask, "Ativo"].astype(str))
+        # Mesma regra do primeiro cartão:
+        # qualidade aprovada + valuation final atrativo/justo.
+        candidate_symbols = set()
+        for _, row in radar_df.iterrows():
+            if (
+                _quality_is_approved(row)
+                and _valuation_direction(row) in {"atrativo", "justo"}
+            ):
+                symbol_value = str(row.get("Ativo", "")).strip()
+                if symbol_value:
+                    candidate_symbols.add(symbol_value)
+
         candidates = clear_df[
             clear_df["Ativo"].astype(str).isin(candidate_symbols)
         ].copy()
@@ -1193,8 +1234,11 @@ with tab_help:
         **9. Projeção visual do alvo de 12 meses.**  
         A aba **Detalhar ativo** mostra também uma linha entre o preço atual e o alvo final validado de 12 meses. Os pontos intermediários são apenas interpolação linear para visualização; não são previsão mensal e não alteram o valuation.
 
-        **10. Borda verde na tabela.**  
-        Uma linha recebe borda verde quando o **preço atual está abaixo do alvo final validado de 12 meses**. É apenas destaque visual do mesmo critério usado pelo valuation conclusivo; não cria nova regra de entrada.
+        **10. Destaque verde na tabela.**  
+        Quando o **preço atual está abaixo do alvo final validado de 12 meses**, a linha recebe um marcador **🟢** e fundo verde suave; a borda verde CSS também é aplicada quando o frontend do Streamlit a suporta. É apenas destaque visual do mesmo critério usado pelo valuation conclusivo; não cria nova regra de entrada.
+
+        **11. Aba Candidatos alinhada aos cartões.**  
+        A aba **Candidatos** usa exatamente a mesma regra do primeiro cartão superior: empresa com qualidade aprovada (Forte/Excelente no grupo) e valuation final atrativo/justo pelo alvo validado de 12 meses. A confiança dos quatro métodos continua sendo mostrada separadamente.
         """
     )
 
