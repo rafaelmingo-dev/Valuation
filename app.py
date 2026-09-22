@@ -265,10 +265,24 @@ def _fmt_score(value):
 
 
 def _fmt_percent(value):
+    """
+    Formata percentuais sem alterar o valor econômico.
+
+    O radar_df mantém Upside/Downside como razão decimal em campos numéricos
+    (ex.: -0.196 = -19,6%). Quando o valor já chega como texto com "%", ele
+    já está em pontos percentuais e não deve ser multiplicado novamente.
+    """
     n = _parse_number(value)
     if n is None:
         text = "" if value is None else str(value).strip()
         return text or "n/d"
+
+    if isinstance(value, str):
+        if "%" not in value:
+            n *= 100.0
+    else:
+        n *= 100.0
+
     return f"{n:+.1f}%".replace(".", ",")
 
 
@@ -501,9 +515,9 @@ def build_clear_decision_table(snapshot, radar_df: pd.DataFrame) -> pd.DataFrame
                 "Qualidade para carteira": _quality_answer(row, detail),
                 "Quality Score": row.get("Quality Score", "n/d"),
                 "Classe no grupo": row.get("Classe de qualidade", "n/d"),
-                "Preço atual": row.get("Preço atual", "n/d"),
-                "Alvo 12m": row.get("Alvo validado 12m", "n/d"),
-                "Upside/Downside": row.get("Upside/Downside", "n/d"),
+                "Preço atual": _fmt_money(row.get("Preço atual")),
+                "Alvo 12m": _fmt_money(row.get("Alvo validado 12m")),
+                "Upside/Downside": _fmt_percent(row.get("Upside/Downside")),
                 "Está barato?": _price_answer(row, detail),
                 "Confiança": row.get("Confiança", "n/d"),
                 "Conclusão para carteira": _portfolio_conclusion(row, detail),
@@ -613,7 +627,7 @@ snapshot = load_snapshot()
 
 c1, c2 = st.columns([1.35, 4.65], vertical_alignment="center")
 with c1:
-    if st.button("🔄 ATUALIZAR RADAR", type="primary", use_container_width=True):
+    if st.button("🔄 ATUALIZAR RADAR", type="primary", width="stretch"):
         with st.spinner("Executando o motor completo do Radar W1. Aguarde..."):
             ok, message = run_update()
         if ok:
@@ -691,14 +705,16 @@ with tab_radar:
     selected = render_selectable_table(clear_df, key="radar_main_clear")
     if selected:
         st.session_state["selected_asset"] = selected
+        st.session_state["detail_asset_pending"] = selected
 
     active = st.session_state.get("selected_asset")
     if active:
         st.divider()
         render_decision_card(snapshot, radar_df, active)
-
-        with st.expander("Abrir detalhamento técnico completo do ativo", expanded=False):
-            render_asset_detail(snapshot, active, compact=True)
+        st.info(
+            "Para abrir gráfico, candles, volume e auditoria técnica completa deste ativo, "
+            "use a aba **Detalhar ativo**. O ativo selecionado será levado automaticamente para lá."
+        )
 
 
 # =============================================================================
@@ -733,14 +749,13 @@ with tab_candidates:
             )
             if picked:
                 st.session_state["selected_asset"] = picked
+                st.session_state["detail_asset_pending"] = picked
                 st.divider()
                 render_decision_card(snapshot, radar_df, picked)
-
-                with st.expander(
-                    "Abrir detalhamento técnico completo do candidato",
-                    expanded=False,
-                ):
-                    render_asset_detail(snapshot, picked, compact=False)
+                st.info(
+                    "Para abrir gráfico, candles, volume e auditoria técnica completa deste candidato, "
+                    "use a aba **Detalhar ativo**. O ativo selecionado será levado automaticamente para lá."
+                )
 
 
 # =============================================================================
@@ -772,7 +787,7 @@ with tab_watch:
 
         st.dataframe(
             w,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=650,
         )
@@ -798,7 +813,7 @@ with tab_watch:
             else:
                 st.dataframe(
                     fallback_watch,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                     height=650,
                 )
@@ -819,6 +834,10 @@ with tab_detail:
 
     default_symbol = st.session_state.get("selected_asset")
     default_index = order.index(default_symbol) if default_symbol in order else 0
+
+    pending_symbol = st.session_state.pop("detail_asset_pending", None)
+    if pending_symbol in order:
+        st.session_state["detail_asset_select"] = pending_symbol
 
     symbol = st.selectbox(
         "Ativo",
