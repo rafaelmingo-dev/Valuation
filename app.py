@@ -877,15 +877,26 @@ with tab_watch:
         w = _ensure_asset_column(watch)
 
         if "Ativo" in w.columns and not clear_df.empty:
-            enrich = clear_df[
-                [
-                    "Ativo",
-                    "Qualidade para carteira",
-                    "Está barato?",
-                    "Conclusão para carteira",
-                ]
-            ].copy()
-            w = w.merge(enrich, on="Ativo", how="left")
+            # Enriquece a watchlist apenas com colunas que REALMENTE existem
+            # na visão executiva atual. Isso evita KeyError caso a interface
+            # evolua e algum nome de coluna seja alterado.
+            desired_columns = [
+                "Ativo",
+                "Qualidade para carteira",
+                "Valuation final",
+                "Confiança",
+                "Auditoria dos métodos",
+                "Conclusão para carteira",
+            ]
+            available_columns = [
+                col for col in desired_columns
+                if col in clear_df.columns
+            ]
+
+            # "Ativo" é obrigatório para o merge; as demais são opcionais.
+            if "Ativo" in available_columns:
+                enrich = clear_df[available_columns].copy()
+                w = w.merge(enrich, on="Ativo", how="left")
 
         st.dataframe(
             w,
