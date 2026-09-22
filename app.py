@@ -8,6 +8,7 @@ import unicodedata
 from pathlib import Path
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from radar_store import read_snapshot
@@ -585,6 +586,168 @@ def build_clear_decision_table(snapshot, radar_df: pd.DataFrame) -> pd.DataFrame
 
 
 
+def _row_border_for_attractive(row: pd.Series):
+    """
+    Destaca visualmente, sem alterar nenhum dado, as linhas em que o preço atual
+    está abaixo do alvo final validado de 12 meses.
+
+    A borda é apenas um sinal visual. O critério econômico continua sendo o mesmo
+    já usado pelo painel: alvo validado 12m > preço atual.
+    """
+    price = _parse_number(row.get("Preço atual"))
+    target = _parse_number(row.get("Alvo validado 12m"))
+
+    if price is None or target is None or not (target > price):
+        return [""] * len(row)
+
+    base = "border-top: 2px solid #22c55e; border-bottom: 2px solid #22c55e;"
+    styles = [base] * len(row)
+
+    if styles:
+        styles[0] += " border-left: 2px solid #22c55e;"
+        styles[-1] += " border-right: 2px solid #22c55e;"
+
+    return styles
+
+
+
+def render_highlighted_selectable_table(
+    df: pd.DataFrame,
+    *,
+    key: str,
+    height: int = 650,
+):
+    """
+    Tabela selecionável local do app.py.
+
+    Mantém seleção por linha e acrescenta uma borda verde somente quando
+    preço atual < alvo validado 12m. Nenhum valor econômico é recalculado.
+    """
+    if df is None or df.empty:
+        st.info("Sem dados.")
+        return None
+
+    display = df.copy().reset_index(drop=True)
+
+    styler = display.style.apply(_row_border_for_attractive, axis=1)
+
+    formatters = {}
+    if "Preço atual" in display.columns:
+        formatters["Preço atual"] = lambda x: _fmt_money(x)
+    if "Alvo validado 12m" in display.columns:
+        formatters["Alvo validado 12m"] = lambda x: _fmt_money(x)
+    if "Upside/Downside" in display.columns:
+        formatters["Upside/Downside"] = lambda x: _fmt_percent(x)
+
+    if formatters:
+        styler = styler.format(formatters)
+
+    event = st.dataframe(
+        styler,
+        width="stretch",
+        hide_index=True,
+        height=height,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=key,
+    )
+
+    rows = getattr(getattr(event, "selection", None), "rows", None)
+    if not rows:
+        return None
+
+    try:
+        selected_row = int(rows[0])
+        return str(display.iloc[selected_row]["Ativo"])
+    except Exception:
+        return None
+
+
+
+def render_target_projection_chart(radar_df: pd.DataFrame, symbol: str):
+    """
+    Exibe uma projeção VISUAL do preço atual até o alvo oficial de 12 meses.
+
+    A linha intermediária é uma interpolação linear entre os dois pontos já
+    calculados pelo Radar. Ela NÃO é uma previsão mensal, não altera o valuation
+    e não cria novos preços-alvo.
+    """
+    if not symbol or radar_df is None or radar_df.empty:
+        return
+
+    current = radar_df[radar_df["Ativo"].astype(str) == str(symbol)]
+    if current.empty:
+        return
+
+    row = current.iloc[0]
+    price, target, upside_ratio = _valuation_numbers(row)
+
+    st.subheader("Projeção visual até o preço-alvo de 12 meses")
+
+    if price is None or target is None or price <= 0:
+        st.info(
+            "Este ativo não possui preço atual e alvo final validado suficientes "
+            "para montar a projeção visual. Para ITSA4, NAV/SOTP continua pendente."
+        )
+        return
+
+    months = list(range(13))
+    projected = [
+        price + (target - price) * (month / 12.0)
+        for month in months
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=months,
+            y=projected,
+            mode="lines+markers",
+            name="Trajetória linear de referência",
+            hovertemplate="Mês %{x}<br>R$ %{y:.2f}<extra></extra>",
+        )
+    )
+
+    fig.add_hline(
+        y=price,
+        line_dash="dot",
+        annotation_text=f"Preço atual: {_fmt_money(price)}",
+        annotation_position="bottom right",
+    )
+    fig.add_hline(
+        y=target,
+        line_dash="dash",
+        annotation_text=f"Alvo 12m: {_fmt_money(target)}",
+        annotation_position="top right",
+    )
+
+    fig.update_layout(
+        title=f"{symbol} — preço atual → alvo final validado em 12 meses",
+        xaxis_title="Meses a partir de hoje",
+        yaxis_title="R$ por ação",
+        height=440,
+        margin=dict(l=20, r=20, t=70, b=30),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=1.10, x=0),
+    )
+    fig.update_xaxes(dtick=1, range=[0, 12])
+
+    st.plotly_chart(
+        fig,
+        width="stretch",
+        key=f"target_projection_{symbol}",
+    )
+
+    change_txt = _fmt_percent(upside_ratio) if upside_ratio is not None else "n/d"
+    st.caption(
+        f"Preço atual {_fmt_money(price)} → alvo final 12m {_fmt_money(target)} "
+        f"({change_txt}). A trajetória entre hoje e o mês 12 é apenas uma "
+        "interpolação linear para visualização; não representa previsão mensal "
+        "de cotação nem altera o valuation."
+    )
+
+
+
 def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
     """Resumo executivo: qualidade, valuation conclusivo e confiança dos métodos."""
     if not symbol or radar_df is None or radar_df.empty:
@@ -803,8 +966,9 @@ with tab_radar:
     )
 
     render_decision_legend()
+    st.caption("🟢 Borda verde = preço atual abaixo do alvo final validado de 12 meses.")
 
-    selected = render_selectable_table(clear_df, key="radar_main_clear")
+    selected = render_highlighted_selectable_table(clear_df, key="radar_main_clear")
     if selected:
         st.session_state["selected_asset"] = selected
         st.session_state["detail_asset_pending"] = selected
@@ -845,9 +1009,10 @@ with tab_candidates:
         if candidates.empty:
             st.info("Nenhum ativo está nesta categoria na atualização atual.")
         else:
-            picked = render_selectable_table(
+            picked = render_highlighted_selectable_table(
                 candidates,
                 key="candidate_table_clear",
+                height=320,
             )
             if picked:
                 st.session_state["selected_asset"] = picked
@@ -968,6 +1133,9 @@ with tab_detail:
     render_decision_card(snapshot, radar_df, symbol)
 
     st.divider()
+    render_target_projection_chart(radar_df, symbol)
+
+    st.divider()
     st.subheader("Detalhamento técnico")
     render_asset_detail(snapshot, symbol, compact=False)
 
@@ -1019,8 +1187,14 @@ with tab_help:
         **7. ITSA4 permanece especial.**  
         O painel não transforma a proxy contábil da holding em preço-alvo validado; NAV/SOTP continua pendente.
 
-        **8. Gráfico.**  
+        **8. Gráfico histórico.**  
         Candles e volume são carregados separadamente apenas para visualização. Eles não alteram Quality Score, valuation, confiança ou Status de Carteira.
+
+        **9. Projeção visual do alvo de 12 meses.**  
+        A aba **Detalhar ativo** mostra também uma linha entre o preço atual e o alvo final validado de 12 meses. Os pontos intermediários são apenas interpolação linear para visualização; não são previsão mensal e não alteram o valuation.
+
+        **10. Borda verde na tabela.**  
+        Uma linha recebe borda verde quando o **preço atual está abaixo do alvo final validado de 12 meses**. É apenas destaque visual do mesmo critério usado pelo valuation conclusivo; não cria nova regra de entrada.
         """
     )
 
