@@ -333,77 +333,117 @@ def _quality_answer(row: pd.Series, detail: dict | None):
     return f"QUALIDADE NÃO CLASSIFICADA ({score})"
 
 
+def _quality_is_approved(row: pd.Series) -> bool:
+    """Usa somente a classe de qualidade já calculada pelo motor."""
+    quality_class = _normalize_text(row.get("Classe de qualidade", ""))
+    return "excelente" in quality_class or "forte" in quality_class
+
+
+def _valuation_numbers(row: pd.Series):
+    """
+    Retorna preço, alvo e diferença percentual a partir dos campos já calculados.
+    A diferença é derivada apenas quando o campo Upside/Downside não estiver disponível.
+    """
+    price = _parse_number(row.get("Preço atual"))
+    target = _parse_number(row.get("Alvo validado 12m"))
+
+    raw_upside = row.get("Upside/Downside")
+    upside = _parse_number(raw_upside)
+
+    if upside is not None:
+        if isinstance(raw_upside, str) and "%" in raw_upside:
+            upside_ratio = upside / 100.0
+        else:
+            upside_ratio = upside
+    elif price is not None and target is not None and price != 0:
+        upside_ratio = target / price - 1.0
+    else:
+        upside_ratio = None
+
+    return price, target, upside_ratio
+
+
+def _conclusive_valuation(row: pd.Series) -> str:
+    """
+    Valuation FINAL conclusivo pelo alvo oficial validado de 12 meses.
+
+    Não cria margem de segurança nem novo preço-alvo:
+    - alvo final > preço atual  -> ATRATIVO pelo alvo final;
+    - alvo final < preço atual  -> CARO pelo alvo final;
+    - alvo final = preço atual  -> NO PREÇO JUSTO;
+    - sem alvo validado         -> N/D (ex.: holding que exige NAV/SOTP).
+
+    A divergência entre os quatro métodos passa a ser tratada como CONFIANÇA/AUDITORIA,
+    e não como ausência de conclusão do valuation final.
+    """
+    price, target, _ = _valuation_numbers(row)
+
+    if price is None or target is None or price <= 0:
+        return "N/D — SEM ALVO VALIDADO / NAV-SOTP PENDENTE"
+
+    if target > price:
+        return "ATRATIVO — ALVO FINAL ACIMA DO PREÇO"
+    if target < price:
+        return "CARO — ALVO FINAL ABAIXO DO PREÇO"
+    return "NO PREÇO JUSTO — ALVO FINAL = PREÇO"
+
+
+def _valuation_direction(row: pd.Series) -> str:
+    verdict = _normalize_text(_conclusive_valuation(row))
+    if "atrativo" in verdict:
+        return "atrativo"
+    if "caro" in verdict:
+        return "caro"
+    if "preco justo" in verdict:
+        return "justo"
+    return "nd"
+
+
+def _method_audit_text(row: pd.Series) -> str:
+    status = str(row.get("Valuation Status", "n/d")).strip() or "n/d"
+    confidence = str(row.get("Confiança", "n/d")).strip() or "n/d"
+    return f"{status} | confiança {confidence}"
+
+
 def _price_answer(row: pd.Series, detail: dict | None):
     """
-    Traduz somente o Valuation Status já calculado pelo motor.
-    Não cria margem de segurança ou limite novo de upside/downside.
+    Responde de forma conclusiva usando o ALVO FINAL VALIDADO do próprio motor.
+
+    O antigo Valuation Status (consenso/divergência dos quatro métodos) continua
+    preservado como auditoria de confiança, mas não impede o veredito final.
     """
-    detail = detail or {}
+    return _conclusive_valuation(row)
 
-    explicit = _detail_value(
-        detail,
-        "Está barato hoje?",
-        "Preço está atrativo?",
-    )
-    if explicit:
-        return explicit
-
-    valuation = str(row.get("Valuation Status", "")).strip()
-    vn = _normalize_text(valuation)
-
-    if "atrativo" in vn or "consenso de upside" in vn:
-        return "SIM — PREÇO ATRATIVO PELO MODELO"
-
-    if "caro" in vn or "consenso de downside" in vn:
-        return "NÃO — CARO PELO MODELO"
-
-    if (
-        "inconclus" in vn
-        or "misto" in vn
-        or "diverg" in vn
-        or "sem consenso" in vn
-    ):
-        return "INCONCLUSIVO — MÉTODOS NÃO CONFIRMAM ENTRADA"
-
-    if "nav" in vn or "sotp" in vn or "sem alvo" in vn:
-        return "N/D — NAV/SOTP PENDENTE"
-
-    return valuation or "N/D"
 
 
 def _portfolio_conclusion(row: pd.Series, detail: dict | None):
-    detail = detail or {}
+    """
+    Combina a classe de qualidade já calculada com o valuation final conclusivo.
+    Não cria score, alvo ou margem de segurança novos.
+    """
+    quality_ok = _quality_is_approved(row)
+    direction = _valuation_direction(row)
 
-    explicit = _detail_value(
-        detail,
-        "Conclusão direta",
-        "Leitura para carteira",
-    )
-    if explicit:
-        return explicit
+    if direction == "nd":
+        return "⚪ PREÇO NÃO CLASSIFICÁVEL — SEM ALVO VALIDADO / NAV-SOTP PENDENTE"
 
-    status = str(row.get("Status de Carteira", "")).strip()
-    sn = _normalize_text(status)
+    if quality_ok and direction == "atrativo":
+        return "⭐ BOA EMPRESA + VALUATION ATRATIVO"
 
-    if "candidato prioritario" in sn:
-        return "⭐ BOA EMPRESA + PREÇO ATRATIVO"
+    if quality_ok and direction == "caro":
+        return "🟡 BOA EMPRESA, MAS VALUATION CARO"
 
-    if "aguardar preco" in sn:
-        return "🟡 BOA EMPRESA — AGUARDAR PREÇO"
+    if quality_ok and direction == "justo":
+        return "🟢 BOA EMPRESA — NO PREÇO JUSTO DO MODELO"
 
-    if "valuation inconclusivo" in sn:
-        return "🟣 BOA EMPRESA — PREÇO NÃO CONFIRMADO"
+    if (not quality_ok) and direction == "atrativo":
+        return "🔎 PREÇO ATRATIVO, MAS QUALIDADE NÃO PRIORITÁRIA"
 
-    if "monitorar" in sn:
-        return "⚪ MONITORAR — QUALIDADE/PREÇO AINDA NÃO CONFIRMAM PRIORIDADE"
+    if (not quality_ok) and direction == "caro":
+        return "🔴 NÃO PRIORITÁRIO — QUALIDADE NÃO PRIORITÁRIA + VALUATION CARO"
 
-    if "fora da prioridade" in sn:
-        return "🔴 NÃO PRIORITÁRIO NO ESTADO ATUAL"
+    return "⚪ MONITORAR — QUALIDADE NÃO PRIORITÁRIA"
 
-    if "nav" in sn or "sotp" in sn:
-        return "⚪ PREÇO NÃO CLASSIFICÁVEL — NAV/SOTP PENDENTE"
-
-    return status or "N/D"
 
 
 def _quality_reason(row: pd.Series, detail: dict | None):
@@ -427,77 +467,93 @@ def _quality_reason(row: pd.Series, detail: dict | None):
 
 
 def _valuation_reason(row: pd.Series, detail: dict | None):
+    """
+    Explica DUAS coisas separadas:
+    1) o veredito final, sempre baseado no alvo oficial validado;
+    2) por que os métodos podem divergir e qual é a confiança desse veredito.
+    """
     detail = detail or {}
+
+    price, target, upside_ratio = _valuation_numbers(row)
+    verdict = _conclusive_valuation(row)
+    method_status = str(row.get("Valuation Status", "n/d")).strip() or "n/d"
+    confidence = str(row.get("Confiança", "n/d")).strip() or "n/d"
+
+    price_txt = _fmt_money(price)
+    target_txt = _fmt_money(target)
+    upside_txt = _fmt_percent(upside_ratio) if upside_ratio is not None else "n/d"
 
     explicit = _detail_value(
         detail,
         "Motivo do preço — números",
         "Evidências do valuation",
     )
-    if explicit:
-        return explicit
 
-    price = _fmt_money(row.get("Preço atual"))
-    target = _fmt_money(row.get("Alvo validado 12m"))
-    upside = _fmt_percent(row.get("Upside/Downside"))
-    valuation = str(row.get("Valuation Status", "n/d"))
-    confidence = str(row.get("Confiança", "n/d"))
-
-    return (
-        f"Preço {price}; alvo validado 12m {target}; diferença {upside}. "
-        f"Valuation: {valuation}. Confiança: {confidence}."
+    base = (
+        f"VEREDITO FINAL: {verdict}. Preço atual {price_txt}; alvo oficial validado 12m "
+        f"{target_txt}; diferença {upside_txt}. Auditoria dos métodos: {method_status}. "
+        f"Confiança: {confidence}."
     )
+
+    if explicit:
+        return base + " " + explicit
+
+    return base
+
 
 
 def _what_to_do(row: pd.Series, detail: dict | None):
-    detail = detail or {}
+    quality_ok = _quality_is_approved(row)
+    direction = _valuation_direction(row)
+    confidence = str(row.get("Confiança", "n/d")).strip() or "n/d"
 
-    explicit = _detail_value(detail, "O que fazer")
-    if explicit:
-        return explicit
+    if direction == "nd":
+        return "Não usar preço justo para decisão até existir alvo validado; para ITSA4, concluir NAV/SOTP."
 
-    status = str(row.get("Status de Carteira", "")).strip()
-    sn = _normalize_text(status)
+    if quality_ok and direction == "atrativo":
+        return (
+            "Aprofundar a tese e os riscos específicos para eventual inclusão em carteira. "
+            f"A confiança dos métodos é {confidence}; divergência reduz confiança, mas não muda o sinal do alvo final."
+        )
 
-    if "candidato prioritario" in sn:
-        return "Aprofundar a tese e os riscos específicos antes de eventual inclusão em carteira."
+    if quality_ok and direction == "caro":
+        return (
+            "Manter na watchlist e aguardar preço melhor ou aumento do alvo pelos fundamentos. "
+            f"A confiança dos métodos é {confidence}."
+        )
 
-    if "aguardar preco" in sn:
-        return "Manter na watchlist e reavaliar quando o preço cair ou os fundamentos elevarem o alvo."
+    if quality_ok and direction == "justo":
+        return "Manter na watchlist e avaliar a tese; o preço está praticamente no alvo final do modelo."
 
-    if "valuation inconclusivo" in sn:
-        return "Manter na watchlist; não usar o alvo composto isoladamente enquanto os métodos divergirem."
+    if (not quality_ok) and direction == "atrativo":
+        return (
+            "O preço está abaixo do alvo final, mas a qualidade não é prioritária no Radar. "
+            "Investigar a qualidade antes de considerar entrada."
+        )
 
-    if "monitorar" in sn:
-        return "Acompanhar, mas não priorizar enquanto qualidade e/ou valuation não melhorarem."
+    return "Não priorizar no estado atual; qualidade não prioritária e/ou valuation caro pelo alvo final."
 
-    if "fora da prioridade" in sn:
-        return "Não priorizar no estado atual; reavaliar somente com mudança relevante de preço ou fundamentos."
-
-    if "nav" in sn or "sotp" in sn:
-        return "Concluir NAV/SOTP antes de usar preço justo como base de decisão."
-
-    return "Acompanhar a próxima atualização do Radar."
 
 
 def _short_numeric_reason(row: pd.Series):
-    """
-    Texto curto e objetivo para a tabela principal.
-    Usa somente campos já calculados.
-    """
+    """Resumo curto do veredito final + auditoria dos métodos."""
+    price, target, upside_ratio = _valuation_numbers(row)
     return (
-        f"Score {_fmt_score(row.get('Quality Score'))} • "
-        f"preço {_fmt_money(row.get('Preço atual'))} • "
-        f"alvo {_fmt_money(row.get('Alvo validado 12m'))} "
-        f"({_fmt_percent(row.get('Upside/Downside'))}) • "
-        f"{row.get('Valuation Status', 'n/d')}"
+        f"Preço {_fmt_money(price)} • alvo {_fmt_money(target)} "
+        f"({_fmt_percent(upside_ratio) if upside_ratio is not None else 'n/d'}) • "
+        f"{_conclusive_valuation(row)} • métodos: {_method_audit_text(row)}"
     )
+
 
 
 def build_clear_decision_table(snapshot, radar_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Cria SOMENTE uma visão da interface.
-    Os campos econômicos vêm do radar_df / snapshot sem recalculá-los.
+    Visão executiva sem recalcular o valuation.
+
+    IMPORTANTE PARA O STREAMLIT:
+    Preço atual, alvo e Upside/Downside permanecem em formato NUMÉRICO bruto.
+    O render_selectable_table/radar_ui é quem formata esses campos. Isso evita
+    converter os números em strings e depois vê-los aparecer como n/d.
     """
     if radar_df is None or radar_df.empty:
         return pd.DataFrame()
@@ -513,13 +569,13 @@ def build_clear_decision_table(snapshot, radar_df: pd.DataFrame) -> pd.DataFrame
             {
                 "Ativo": symbol,
                 "Qualidade para carteira": _quality_answer(row, detail),
-                "Quality Score": row.get("Quality Score", "n/d"),
-                "Classe no grupo": row.get("Classe de qualidade", "n/d"),
-                "Preço atual": _fmt_money(row.get("Preço atual")),
-                "Alvo 12m": _fmt_money(row.get("Alvo validado 12m")),
-                "Upside/Downside": _fmt_percent(row.get("Upside/Downside")),
-                "Está barato?": _price_answer(row, detail),
+                # Mantém os nomes que o radar_ui já conhece para formatação.
+                "Preço atual": row.get("Preço atual"),
+                "Alvo validado 12m": row.get("Alvo validado 12m"),
+                "Upside/Downside": row.get("Upside/Downside"),
+                "Valuation final": _conclusive_valuation(row),
                 "Confiança": row.get("Confiança", "n/d"),
+                "Auditoria dos métodos": row.get("Valuation Status", "n/d"),
                 "Conclusão para carteira": _portfolio_conclusion(row, detail),
                 "Motivo objetivo": _short_numeric_reason(row),
             }
@@ -528,10 +584,9 @@ def build_clear_decision_table(snapshot, radar_df: pd.DataFrame) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 
+
 def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
-    """
-    Resumo executivo exibido ANTES do detalhamento técnico.
-    """
+    """Resumo executivo: qualidade, valuation conclusivo e confiança dos métodos."""
     if not symbol or radar_df is None or radar_df.empty:
         return
 
@@ -543,11 +598,13 @@ def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
     detail = _decision_lookup(snapshot).get(str(symbol), {})
 
     quality_answer = _quality_answer(row, detail)
-    price_answer = _price_answer(row, detail)
+    price_answer = _conclusive_valuation(row)
     conclusion = _portfolio_conclusion(row, detail)
     quality_reason = _quality_reason(row, detail)
     valuation_reason = _valuation_reason(row, detail)
     action = _what_to_do(row, detail)
+
+    price, target, upside_ratio = _valuation_numbers(row)
 
     asset_data = snapshot.get("assets", {}).get(symbol, {})
     name = asset_data.get("name", symbol)
@@ -558,11 +615,14 @@ def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
     with m1:
         st.metric("Quality Score", _fmt_score(row.get("Quality Score")))
     with m2:
-        st.metric("Preço atual", _fmt_money(row.get("Preço atual")))
+        st.metric("Preço atual", _fmt_money(price))
     with m3:
-        st.metric("Alvo validado 12m", _fmt_money(row.get("Alvo validado 12m")))
+        st.metric("Alvo validado 12m", _fmt_money(target))
     with m4:
-        st.metric("Upside/Downside", _fmt_percent(row.get("Upside/Downside")))
+        st.metric(
+            "Upside/Downside",
+            _fmt_percent(upside_ratio) if upside_ratio is not None else "n/d",
+        )
 
     with st.container(border=True):
         st.markdown("#### 1. É uma empresa forte para carteira?")
@@ -570,9 +630,13 @@ def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
         st.write(quality_reason)
 
     with st.container(border=True):
-        st.markdown("#### 2. O preço atual está atrativo?")
-        st.markdown(f"**{price_answer}**")
+        st.markdown("#### 2. Valuation final: atrativo ou caro?")
+        st.markdown(f"### {price_answer}")
         st.write(valuation_reason)
+        st.caption(
+            "O alvo final oficial é conclusivo quando existe preço e alvo válidos. "
+            "Divergência entre DCF/RI e métodos secundários afeta a confiança, não transforma o alvo final em 'inconclusivo'."
+        )
 
     with st.container(border=True):
         st.markdown("#### 3. Conclusão do Radar para carteira")
@@ -580,37 +644,72 @@ def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
         st.write(action)
 
     st.caption(
-        "A leitura acima apenas traduz os resultados já calculados pelo Radar. "
-        "Não cria novo preço-alvo, novo Quality Score, novo peso ou nova margem de segurança."
+        "A interface não cria novo preço-alvo, Quality Score, peso ou margem de segurança. "
+        "Ela usa o alvo final validado do motor e mantém a divergência dos métodos como auditoria de confiança."
     )
 
 
+
 def render_decision_legend():
-    with st.expander("Como interpretar as conclusões"):
+    with st.expander("Como interpretar o valuation conclusivo"):
         st.markdown(
             """
-            **⭐ BOA EMPRESA + PREÇO ATRATIVO**  
-            Qualidade aprovada e valuation favorável. É o grupo que merece aprofundamento primeiro; não significa compra automática.
+            **O valuation final agora é sempre conclusivo quando há preço atual e alvo final validado.**
 
-            **🟡 BOA EMPRESA — AGUARDAR PREÇO**  
-            A qualidade passa, mas o valuation indica que o preço atual está acima do valor encontrado pelo modelo.
+            - **ATRATIVO** = alvo final validado de 12 meses acima do preço atual.
+            - **CARO** = alvo final validado de 12 meses abaixo do preço atual.
+            - **NO PREÇO JUSTO** = alvo final igual ao preço atual.
+            - **N/D** = não existe alvo validado adequado; ITSA4 continua exigindo NAV/SOTP.
 
-            **🟣 BOA EMPRESA — PREÇO NÃO CONFIRMADO**  
-            A qualidade passa, porém os métodos de valuation não convergem. Não use o alvo composto isoladamente como preço de entrada.
+            **Por que antes aparecia "INCONCLUSIVO"?**  
+            Porque o painel estava usando a divergência entre os quatro métodos como se fosse a conclusão do valuation. Agora essa divergência permanece apenas como **Auditoria dos métodos / Confiança**. O alvo final oficial continua sendo o veredito econômico do motor.
 
-            **⚪ MONITORAR**  
-            Qualidade e/ou valuation ainda não fornecem evidência suficiente para prioridade.
+            Exemplo: se o alvo final está acima da cotação, o painel mostra **ATRATIVO**, mesmo que DCF/RI e múltiplos discordem. Nesse caso a confiança pode ser 1/4, 2/4 ou 3/4 — mas o valuation final deixa de ser chamado de inconclusivo.
 
-            **🔴 NÃO PRIORITÁRIO**  
-            A combinação atual de qualidade e preço não justifica prioridade no Radar.
-
-            **NAV/SOTP PENDENTE**  
-            Não concluir barato/caro enquanto o valuation adequado da holding não estiver concluído.
-
-            **Importante:** `Excelente/Forte no grupo` continua sendo uma comparação relativa dentro do universo W1.  
-            Por isso o painel mantém separados o **Quality Score numérico** e a **Classe no grupo**.
+            **Qualidade continua separada do preço.** `Excelente/Forte no grupo` permanece a classificação relativa já calculada pelo Quality Score.
             """
         )
+
+
+def render_conclusive_summary_cards(radar_df: pd.DataFrame):
+    """Resumo superior coerente com o valuation conclusivo do alvo final."""
+    if radar_df is None or radar_df.empty:
+        return
+
+    strong_attractive = 0
+    strong_expensive = 0
+    other_attractive = 0
+    other_expensive = 0
+    no_target = 0
+
+    for _, row in radar_df.iterrows():
+        quality_ok = _quality_is_approved(row)
+        direction = _valuation_direction(row)
+
+        if direction == "nd":
+            no_target += 1
+        elif quality_ok and direction in {"atrativo", "justo"}:
+            strong_attractive += 1
+        elif quality_ok and direction == "caro":
+            strong_expensive += 1
+        elif (not quality_ok) and direction in {"atrativo", "justo"}:
+            other_attractive += 1
+        elif (not quality_ok) and direction == "caro":
+            other_expensive += 1
+
+    cols = st.columns(5)
+    cards = [
+        ("⭐ Qualidade aprovada + valuation atrativo", strong_attractive),
+        ("🟡 Qualidade aprovada + valuation caro", strong_expensive),
+        ("🔎 Qualidade não prioritária + valuation atrativo", other_attractive),
+        ("🔴 Qualidade não prioritária + valuation caro", other_expensive),
+        ("⚪ Sem alvo validado", no_target),
+    ]
+
+    for col, (label, value) in zip(cols, cards):
+        with col:
+            st.metric(label, value)
+
 
 
 # =============================================================================
@@ -676,7 +775,10 @@ if not snapshot:
 radar_df = main_table(snapshot)
 clear_df = build_clear_decision_table(snapshot, radar_df)
 
-render_summary_cards(radar_df)
+render_conclusive_summary_cards(radar_df)
+with st.expander("Ver categorias originais do motor"):
+    st.caption("Categorias originais preservadas para auditoria. Elas podem marcar divergência de métodos como inconclusiva; a visão principal usa o alvo final validado como conclusão do valuation.")
+    render_summary_cards(radar_df)
 st.write("")
 
 
@@ -696,8 +798,8 @@ tab_radar, tab_candidates, tab_watch, tab_detail, tab_methods, tab_help = st.tab
 with tab_radar:
     st.subheader("Radar W1 — decisão rápida")
     st.caption(
-        "A tabela responde diretamente: a empresa tem qualidade, o preço está atrativo "
-        "e qual é a conclusão atual para carteira. Clique em uma linha para ver os motivos."
+        "A tabela usa o alvo final validado para dar um valuation conclusivo: ATRATIVO ou CARO. "
+        "A divergência dos quatro métodos aparece separadamente como confiança/auditoria. Clique em uma linha para ver os motivos."
     )
 
     render_decision_legend()
@@ -886,7 +988,8 @@ with tab_help:
         **2. A tela principal separa qualidade e preço.**  
         Para cada ativo, o painel responde:
         - se a empresa possui qualidade para carteira segundo os resultados já calculados;
-        - se o preço está atrativo, caro ou inconclusivo;
+        - se o preço está ATRATIVO ou CARO pelo alvo final validado;
+        - por que os quatro métodos podem divergir e qual a confiança dessa conclusão;
         - qual é a conclusão atual para carteira;
         - quais números sustentam essa leitura.
 
@@ -894,7 +997,7 @@ with tab_help:
         A classificação continua sendo relativa ao grupo econômico do universo W1. Por isso a interface mostra separadamente o **Quality Score numérico** e a **Classe no grupo**.
 
         **4. Qualidade e preço são perguntas diferentes.**  
-        Uma empresa pode ter ótima qualidade e estar cara. Também pode haver boa qualidade com valuation inconclusivo. O painel não mistura essas duas perguntas em um novo score.
+        Uma empresa pode ter ótima qualidade e estar cara. A divergência entre os quatro métodos não torna mais o valuation final inconclusivo: ela reduz a confiança. O veredito final vem do alvo validado de 12 meses comparado ao preço atual.
 
         **5. Nenhuma nova fórmula foi criada no `app.py`.**  
         A interface não recalcula DCF, RI, P/L, P/VP, EV/EBITDA, Dividend Yield, WACC, Ke, Quality Score, Confidence Score ou preço-alvo.
