@@ -547,14 +547,80 @@ def _short_numeric_reason(row: pd.Series):
 
 
 
+
+def _target_24m_from_snapshot(snapshot, symbol: str):
+    """
+    Lê o alvo estratégico de 24 meses diretamente dos resultados completos
+    exportados pelo valuation_engine.py.
+
+    O app.py NÃO calcula o alvo de 24 meses. Ele apenas lê:
+      - validated_target_24m
+      - validated_upside_24m
+      - validated_annualized_24m
+
+    FCFF e módulos equity ficam separados no snapshot, mas a interface expõe
+    uma leitura única por ticker.
+    """
+    if not isinstance(snapshot, dict) or not symbol:
+        return {
+            "target_24m": None,
+            "potential_24m": None,
+            "annualized_24m": None,
+            "source": None,
+            "note": None,
+            "error": None,
+        }
+
+    result = None
+    fcff = snapshot.get("results_fcff", {})
+    equity = snapshot.get("results_equity", {})
+
+    if isinstance(fcff, dict) and symbol in fcff:
+        result = fcff.get(symbol)
+    elif isinstance(equity, dict) and symbol in equity:
+        result = equity.get(symbol)
+
+    if not isinstance(result, dict):
+        return {
+            "target_24m": None,
+            "potential_24m": None,
+            "annualized_24m": None,
+            "source": None,
+            "note": None,
+            "error": None,
+        }
+
+    return {
+        "target_24m": _parse_number(result.get("validated_target_24m")),
+        "potential_24m": _parse_number(result.get("validated_upside_24m")),
+        "annualized_24m": _parse_number(result.get("validated_annualized_24m")),
+        "source": result.get("target_24m_source"),
+        "note": result.get("target_24m_note"),
+        "error": result.get("target_24m_error"),
+    }
+
+
+def _fmt_percent_ratio(value):
+    """
+    Formata razões decimais vindas diretamente do motor:
+    0.25 -> +25,0%.
+    """
+    n = _parse_number(value)
+    if n is None:
+        return "n/d"
+    return f"{n * 100.0:+.1f}%".replace(".", ",")
+
+
 def build_clear_decision_table(snapshot, radar_df: pd.DataFrame) -> pd.DataFrame:
     """
     Visão executiva sem recalcular o valuation.
 
     IMPORTANTE PARA O STREAMLIT:
-    Preço atual, alvo e Upside/Downside permanecem em formato NUMÉRICO bruto.
-    O render_selectable_table/radar_ui é quem formata esses campos. Isso evita
-    converter os números em strings e depois vê-los aparecer como n/d.
+    Preço atual, alvos e potenciais permanecem em formato NUMÉRICO bruto.
+    O app formata somente a apresentação.
+
+    O alvo de 12 meses continua sendo o horizonte PRINCIPAL.
+    O alvo de 24 meses é exibido como horizonte ESTRATÉGICO adicional.
     """
     if radar_df is None or radar_df.empty:
         return pd.DataFrame()
@@ -565,15 +631,18 @@ def build_clear_decision_table(snapshot, radar_df: pd.DataFrame) -> pd.DataFrame
     for _, row in radar_df.iterrows():
         symbol = str(row.get("Ativo", "")).strip()
         detail = details.get(symbol, {})
+        horizon24 = _target_24m_from_snapshot(snapshot, symbol)
 
         rows.append(
             {
                 "Ativo": symbol,
                 "Qualidade para carteira": _quality_answer(row, detail),
-                # Mantém os nomes que o radar_ui já conhece para formatação.
                 "Preço atual": row.get("Preço atual"),
                 "Alvo validado 12m": row.get("Alvo validado 12m"),
                 "Upside/Downside": row.get("Upside/Downside"),
+                "Alvo validado 24m": horizon24["target_24m"],
+                "Potencial preço 24m": horizon24["potential_24m"],
+                "CAGR preço 24m": horizon24["annualized_24m"],
                 "Valuation final": _conclusive_valuation(row),
                 "Confiança": row.get("Confiança", "n/d"),
                 "Auditoria dos métodos": row.get("Valuation Status", "n/d"),
@@ -668,6 +737,16 @@ def render_highlighted_selectable_table(
         formatters["Alvo validado 12m"] = lambda x: _fmt_money(x)
     if "Upside/Downside" in display.columns:
         formatters["Upside/Downside"] = lambda x: _fmt_percent(x)
+    if "Alvo validado 24m" in display.columns:
+        formatters["Alvo validado 24m"] = lambda x: _fmt_money(x)
+    if "Potencial preço 24m" in display.columns:
+        formatters["Potencial preço 24m"] = lambda x: _fmt_percent_ratio(x)
+    if "CAGR preço 24m" in display.columns:
+        formatters["CAGR preço 24m"] = lambda x: (
+            _fmt_percent_ratio(x) + " a.a."
+            if _parse_number(x) is not None
+            else "n/d"
+        )
 
     if formatters:
         styler = styler.format(formatters)
@@ -694,13 +773,16 @@ def render_highlighted_selectable_table(
 
 
 
-def render_target_projection_chart(radar_df: pd.DataFrame, symbol: str):
+def render_target_projection_chart(snapshot, radar_df: pd.DataFrame, symbol: str):
     """
-    Exibe uma projeção VISUAL do preço atual até o alvo oficial de 12 meses.
+    Exibe:
+      - preço atual;
+      - alvo oficial validado de 12 meses;
+      - alvo estratégico validado de 24 meses, quando disponível.
 
-    A linha intermediária é uma interpolação linear entre os dois pontos já
-    calculados pelo Radar. Ela NÃO é uma previsão mensal, não altera o valuation
-    e não cria novos preços-alvo.
+    Os pontos de 12m e 24m vêm do valuation_engine.py.
+    As linhas mensais ENTRE esses pontos são apenas interpolação visual e NÃO
+    representam previsão mensal de cotação.
     """
     if not symbol or radar_df is None or radar_df.empty:
         return
@@ -710,30 +792,71 @@ def render_target_projection_chart(radar_df: pd.DataFrame, symbol: str):
         return
 
     row = current.iloc[0]
-    price, target, upside_ratio = _valuation_numbers(row)
+    price, target12, upside12 = _valuation_numbers(row)
+    h24 = _target_24m_from_snapshot(snapshot, symbol)
+    target24 = h24["target_24m"]
+    potential24 = h24["potential_24m"]
+    annualized24 = h24["annualized_24m"]
 
-    st.subheader("Projeção visual até o preço-alvo de 12 meses")
+    st.subheader("Projeção visual — hoje → 12 meses → 24 meses")
 
-    if price is None or target is None or price <= 0:
+    if price is None or target12 is None or price <= 0:
         st.info(
-            "Este ativo não possui preço atual e alvo final validado suficientes "
-            "para montar a projeção visual. Para ITSA4, NAV/SOTP continua pendente."
+            "Este ativo não possui preço atual e alvo final validado de 12 meses "
+            "suficientes para montar a projeção. Para ITSA4, NAV/SOTP continua pendente."
         )
         return
 
-    months = list(range(13))
-    projected = [
-        price + (target - price) * (month / 12.0)
-        for month in months
-    ]
+    if target24 is not None:
+        months = list(range(25))
+        projected = []
+        for month in months:
+            if month <= 12:
+                value = price + (target12 - price) * (month / 12.0)
+            else:
+                value = target12 + (target24 - target12) * ((month - 12) / 12.0)
+            projected.append(value)
+        xmax = 24
+    else:
+        months = list(range(13))
+        projected = [
+            price + (target12 - price) * (month / 12.0)
+            for month in months
+        ]
+        xmax = 12
 
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=months,
             y=projected,
-            mode="lines+markers",
-            name="Trajetória linear de referência",
+            mode="lines",
+            name="Trajetória visual de referência",
+            hovertemplate="Mês %{x}<br>R$ %{y:.2f}<extra></extra>",
+        )
+    )
+
+    marker_x = [0, 12]
+    marker_y = [price, target12]
+    marker_text = [
+        f"Hoje: {_fmt_money(price)}",
+        f"12m: {_fmt_money(target12)}",
+    ]
+
+    if target24 is not None:
+        marker_x.append(24)
+        marker_y.append(target24)
+        marker_text.append(f"24m: {_fmt_money(target24)}")
+
+    fig.add_trace(
+        go.Scatter(
+            x=marker_x,
+            y=marker_y,
+            mode="markers+text",
+            text=marker_text,
+            textposition="top center",
+            marker=dict(size=11),
+            name="Pontos calculados pelo motor",
             hovertemplate="Mês %{x}<br>R$ %{y:.2f}<extra></extra>",
         )
     )
@@ -745,22 +868,32 @@ def render_target_projection_chart(radar_df: pd.DataFrame, symbol: str):
         annotation_position="bottom right",
     )
     fig.add_hline(
-        y=target,
+        y=target12,
         line_dash="dash",
-        annotation_text=f"Alvo 12m: {_fmt_money(target)}",
+        annotation_text=f"Alvo 12m: {_fmt_money(target12)}",
         annotation_position="top right",
     )
+    if target24 is not None:
+        fig.add_hline(
+            y=target24,
+            line_dash="dashdot",
+            annotation_text=f"Alvo 24m: {_fmt_money(target24)}",
+            annotation_position="top left",
+        )
 
     fig.update_layout(
-        title=f"{symbol} — preço atual → alvo final validado em 12 meses",
+        title=(
+            f"{symbol} — preço atual → alvo 12m"
+            + (" → alvo 24m" if target24 is not None else "")
+        ),
         xaxis_title="Meses a partir de hoje",
         yaxis_title="R$ por ação",
-        height=440,
-        margin=dict(l=20, r=20, t=70, b=30),
+        height=480,
+        margin=dict(l=20, r=20, t=80, b=30),
         hovermode="x unified",
-        legend=dict(orientation="h", y=1.10, x=0),
+        legend=dict(orientation="h", y=1.12, x=0),
     )
-    fig.update_xaxes(dtick=1, range=[0, 12])
+    fig.update_xaxes(dtick=2 if xmax == 24 else 1, range=[0, xmax])
 
     st.plotly_chart(
         fig,
@@ -768,13 +901,35 @@ def render_target_projection_chart(radar_df: pd.DataFrame, symbol: str):
         key=f"target_projection_{symbol}",
     )
 
-    change_txt = _fmt_percent(upside_ratio) if upside_ratio is not None else "n/d"
-    st.caption(
-        f"Preço atual {_fmt_money(price)} → alvo final 12m {_fmt_money(target)} "
-        f"({change_txt}). A trajetória entre hoje e o mês 12 é apenas uma "
-        "interpolação linear para visualização; não representa previsão mensal "
-        "de cotação nem altera o valuation."
+    upside12_txt = (
+        _fmt_percent(upside12) if upside12 is not None else "n/d"
     )
+
+    if target24 is not None:
+        pot24_txt = _fmt_percent_ratio(potential24)
+        cagr24_txt = (
+            _fmt_percent_ratio(annualized24) + " a.a."
+            if annualized24 is not None
+            else "n/d"
+        )
+        st.caption(
+            f"Preço atual {_fmt_money(price)} → alvo 12m {_fmt_money(target12)} "
+            f"({upside12_txt}) → alvo 24m {_fmt_money(target24)} "
+            f"({pot24_txt}; CAGR de preço {cagr24_txt}). "
+            "Os pontos de 12 e 24 meses são calculados pelo motor. As linhas entre "
+            "os pontos são somente interpolação visual e não previsão mensal de cotação."
+        )
+    else:
+        error24 = h24.get("error")
+        extra = (
+            f" Motivo do 24m indisponível: {error24}."
+            if error24 else ""
+        )
+        st.caption(
+            f"Preço atual {_fmt_money(price)} → alvo 12m {_fmt_money(target12)} "
+            f"({upside12_txt}). Alvo 24m ainda indisponível neste snapshot.{extra} "
+            "Clique em ATUALIZAR RADAR depois de publicar o valuation_engine.py novo."
+        )
 
 
 
@@ -798,6 +953,7 @@ def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
     action = _what_to_do(row, detail)
 
     price, target, upside_ratio = _valuation_numbers(row)
+    horizon24 = _target_24m_from_snapshot(snapshot, symbol)
 
     asset_data = snapshot.get("assets", {}).get(symbol, {})
     name = asset_data.get("name", symbol)
@@ -813,9 +969,38 @@ def render_decision_card(snapshot, radar_df: pd.DataFrame, symbol: str):
         st.metric("Alvo validado 12m", _fmt_money(target))
     with m4:
         st.metric(
-            "Upside/Downside",
+            "Upside/Downside 12m",
             _fmt_percent(upside_ratio) if upside_ratio is not None else "n/d",
         )
+
+    h1, h2, h3 = st.columns(3)
+    with h1:
+        st.metric(
+            "Alvo estratégico 24m",
+            _fmt_money(horizon24["target_24m"]),
+        )
+    with h2:
+        st.metric(
+            "Potencial preço 24m",
+            _fmt_percent_ratio(horizon24["potential_24m"]),
+        )
+    with h3:
+        st.metric(
+            "CAGR preço 24m",
+            (
+                _fmt_percent_ratio(horizon24["annualized_24m"]) + " a.a."
+                if horizon24["annualized_24m"] is not None
+                else "n/d"
+            ),
+        )
+
+    if horizon24["target_24m"] is not None:
+        st.caption(
+            "24 meses é um horizonte estratégico adicional. "
+            "A classificação principal do Radar e a borda verde continuam baseadas em 12 meses."
+        )
+    elif horizon24.get("error"):
+        st.caption(f"Alvo 24m indisponível: {horizon24['error']}")
 
     with st.container(border=True):
         st.markdown("#### 1. É uma empresa forte para carteira?")
@@ -998,7 +1183,8 @@ with tab_radar:
     render_decision_legend()
     st.caption(
         "🟢 Destaque verde = preço atual abaixo do alvo final validado de 12 meses. "
-        "O marcador verde é sempre exibido; fundo/borda verde são reforços visuais."
+        "O marcador verde é sempre exibido; fundo/borda verde são reforços visuais. "
+        "O alvo de 24 meses é estratégico e não muda a classificação principal."
     )
 
     selected = render_highlighted_selectable_table(clear_df, key="radar_main_clear")
@@ -1090,6 +1276,9 @@ with tab_watch:
                 "Ativo",
                 "Qualidade para carteira",
                 "Valuation final",
+                "Alvo validado 24m",
+                "Potencial preço 24m",
+                "CAGR preço 24m",
                 "Confiança",
                 "Auditoria dos métodos",
                 "Conclusão para carteira",
@@ -1174,7 +1363,7 @@ with tab_detail:
     render_decision_card(snapshot, radar_df, symbol)
 
     st.divider()
-    render_target_projection_chart(radar_df, symbol)
+    render_target_projection_chart(snapshot, radar_df, symbol)
 
     st.divider()
     st.subheader("Detalhamento técnico")
@@ -1231,13 +1420,19 @@ with tab_help:
         **8. Gráfico histórico.**  
         Candles e volume são carregados separadamente apenas para visualização. Eles não alteram Quality Score, valuation, confiança ou Status de Carteira.
 
-        **9. Projeção visual do alvo de 12 meses.**  
-        A aba **Detalhar ativo** mostra também uma linha entre o preço atual e o alvo final validado de 12 meses. Os pontos intermediários são apenas interpolação linear para visualização; não são previsão mensal e não alteram o valuation.
+        **9. Horizonte principal de 12 meses + horizonte estratégico de 24 meses.**  
+        O alvo de **12 meses continua sendo o horizonte principal**: candidatos, valuation conclusivo e destaque verde continuam baseados nele. O novo alvo de **24 meses é estratégico** e vem do `valuation_engine.py`, usando o Ano 2 das projeções já existentes e os mesmos pesos 50% / 20% / 20% / 10%.
 
-        **10. Destaque verde na tabela.**  
+        **10. Projeção visual hoje → 12m → 24m.**  
+        A aba **Detalhar ativo** mostra os pontos calculados pelo motor em 12 e 24 meses. As linhas mensais entre esses pontos são apenas interpolação visual; não são previsão mensal de cotação.
+
+        **11. Potencial de preço em 24 meses.**  
+        `Potencial preço 24m` compara o alvo de 24 meses com o preço atual. `CAGR preço 24m` anualiza somente a valorização implícita do preço; **não inclui dividendos**, portanto não é retorno total.
+
+        **12. Destaque verde na tabela.**  
         Quando o **preço atual está abaixo do alvo final validado de 12 meses**, a linha recebe um marcador **🟢** e fundo verde suave; a borda verde CSS também é aplicada quando o frontend do Streamlit a suporta. É apenas destaque visual do mesmo critério usado pelo valuation conclusivo; não cria nova regra de entrada.
 
-        **11. Aba Candidatos alinhada aos cartões.**  
+        **13. Aba Candidatos alinhada aos cartões.**  
         A aba **Candidatos** usa exatamente a mesma regra do primeiro cartão superior: empresa com qualidade aprovada (Forte/Excelente no grupo) e valuation final atrativo/justo pelo alvo validado de 12 meses. A confiança dos quatro métodos continua sendo mostrada separadamente.
         """
     )
